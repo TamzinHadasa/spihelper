@@ -245,6 +245,8 @@ const spiHelperClerkStatusRegex = /{{(CURequest|awaitingadmin|clerk ?request|(?:
 
 const spiHelperSockSectionWithNewlineRegex = /====\s*Suspected sockpuppets\s*====\n*/i
 
+const spiHelperSocksAtTopOfSectionRegex = /====Suspected sockpuppets====[\n\s]+((\{\{sock ?list|\*\s*\{\{check(user|ip)).*?\n+?)+/
+
 const spiHelperAdminSectionWithPrecedingNewlinesRegex = /\n*\s*====\s*<big>Clerk, CheckUser, and\/or patrolling admin comments<\/big>\s*====\s*/i
 
 const spiHelperCUBlockRegex = /{{(checkuserblock(-account|-wide)?|checkuser block)}}/i
@@ -553,6 +555,40 @@ const spiHelperActionViewHTML = `
   <input type="button" id="spiHelper_performActions" value="Done" />
 </div>
 `
+
+// From a string, get every account or IP listed in a {{checkuser}},
+// {{checkip}}, or {{sock list}} template.
+function spiHelperExtractSocks(text) {
+  const unnamedParameterRegex = /^\s*\d+\s*$/i
+  const socklistResults = text.match(/{{\s*sock\s?list\s*([^}]*)}}/gi)
+  var users = []
+  var ips = []
+  if (socklistResults) {
+    for (let i = 0; i < socklistResults.length; i++) {
+      const socklistMatch = socklistResults[i].match(/{{\s*sock\s?list\s*([^}]*)}}/i)[1]
+      // First split the text into parts based on the presence of a |
+      const socklistArguments = socklistMatch.split('|')
+      for (let j = 0; j < socklistArguments.length; j++) {
+        // Now try to split based on "=", if wasn't able to it means it's an unnamed argument
+        const splitArgument = socklistArguments[j].split('=')
+        let username = ''
+        if (splitArgument.length === 1) {
+          username = spiHelperNormalizeUsername(splitArgument[0])
+        } else if (unnamedParameterRegex.test(splitArgument[0])) {
+          username = spiHelperNormalizeUsername(splitArgument.slice(1).join('='))
+        }
+        if (username !== '') {
+          if (mw.util.isIPAddress(username, true) && !ips.includes(username)) {
+            users.push(username)
+          } else if (!users.includes(username)) {
+            users.push(username)
+          }
+        }
+      }
+    }
+  }
+  return [users, ips];
+}
 /**
  * Big function to generate the SPI form from the top-level menu selections
  *
@@ -792,20 +828,9 @@ async function spiHelperGenerateForm () {
       }
     }
     // eslint-disable-next-line no-useless-escape
-    const userRegex = /{{\s*(?:user|vandal|IP|noping|noping2)[^\|}{]*?\s*\|\s*(?:1=)?\s*([^\|}]*?)\s*}}/gi
-    const userresults = pagetext.match(userRegex)
-    if (userresults) {
-      for (let i = 0; i < userresults.length; i++) {
-        const username = spiHelperNormalizeUsername(userresults[i].replace(userRegex, '$1'))
-        if (mw.util.isIPAddress(username, true) && !possibleips.includes(username) &&
-          !likelyips.includes(username)) {
-          possibleips.push(username)
-        } else if (!possibleusers.includes(username) &&
-          !likelyusers.includes(username)) {
-          possibleusers.push(username)
-        }
-      }
-    }
+    var resultsUsersAndIps = spiHelperExtractSocks
+    likelyusers.push(resultsUsersAndIps[0])
+    likelyips.push(resultsUsersAndIps[1])
     if (spiHelperActionsSelected.Block) {
       if (spiHelperIsAdmin()) {
         $('#spiHelper_blockTagHeader', $actionView).text('Blocking and tagging socks')
@@ -1755,16 +1780,36 @@ async function spiHelperPostRenameCleanup (oldCasePage) {
   newPageText = newPageText.replace(spiHelperArchiveNoticeRegex, '{{SPIarchive notice|' + spiHelperCaseName + '}}')
   // We also want to add the previous master to the sock list
   // We use SOCK_SECTION_RE_WITH_NEWLINE to clean up any extraneous whitespace
-  newPageText = newPageText.replace(spiHelperSockSectionWithNewlineRegex, '====Suspected sockpuppets====' +
-    '\n* {{checkuser|1=' + oldCaseName + '}} ({{clerknote}} original case name)\n')
-  // Also remove the new master if they're in the sock list
-  // This RE is kind of ugly. The idea is that we find everything from the level 4 heading
-  // ending with "sockpuppets" to the level 4 heading beginning with <big> and pull the checkuser
-  // template matching the current case name out. This keeps us from accidentally replacing a
-  // checkuser entry in the admin section
-  const newMasterReString = '(sockpuppets\\s*====.*?)\\n^\\s*\\*\\s*{{checkuser\\|(?:1=)?' + spiHelperCaseName + '(?:\\|master name\\s*=.*?)?}}\\s*$(.*====\\s*<big>)'
-  const newMasterRe = new RegExp(newMasterReString, 'sm')
-  newPageText = newPageText.replace(newMasterRe, '$1\n$2')
+  newPageText = newPageText.replace(spiHelperSockSectionWithNewlineRegex, '====Suspected sockpuppets====\n')
+  // spiHelperSocksAtTopOfSectionRegex gets us all sock templates appearing at the top of the
+  // "Suspected sockpuppets" section (ignoring any that might be mentioned later on in the section.)
+  const sockTemplatesAtTopOfSection = newPageText.match(spiHelperSocksAtTopOfSectionRegex)[0]
+  let newSockList = sockTemplatesAtTopOfSection
+  // We (re)build {{socklist}} if: A) There are any {{checkuser}}s or {{checkip}}s in the text;
+  // B) There is more than one {{socklist}}; or C) {{socklist}} has any positional parameters
+  // without explicit `n=`. Then we increment each positional parameter by 1 so we can put the
+  // original master first.
+  if (sockTemplatesAtTopOfSection.match(/\{\{check/) || sockTemplatesAtTopOfSection.match(/\|[^|=]+(\||\}\})/) || sockTemplatesAtTopOfSection.match(/\{\{sock ?list/).length > 1) {
+    let socksAtTopOfSection = spiHelperExtractSocks(sockTemplatesAtTopOfSection).flat()
+    newSockList = "{{sock list"
+    for (let i = 0; i < socksAtTopOfSection.length; i++) {
+      newSockList += "|" + (i + 2) + "=" + socksAtTopOfSection[i]
+    }
+  }
+  else {
+    // If we don't have to (re) build {{socklist}}, we still have to increment all sock params by 1. 
+    let newSockListSocks = newSockList.match(/\|\s*(?:sock|ip|note|strike)?(\d+)\s*=/)
+    for (let i = 0; i < newSockListSocks.length; i++) {
+      let sockNum = newSockListSocks[i][0]
+      let newSockNum = parseInt(sockNum) + 1
+      newSockList = newSockList.replace(new RegExp("\\|\\s*(sock|ip|note|strike)?" + sockNum), "|$1" + newSockNum + "=")
+    }
+  }
+  // Add the original master as 1=, add the clerk note, and set the parameter to remove the new master's name if it's listed.
+  newSockList = newSockList.replace(/^\{\{[Ss]ock ?list\|/, "{{sock list|1=" + oldCaseName)
+  newSockList = newSockList.replace(/\}\}\n*$/, "|remove_master=yes|note1=({{Clerk note}} Original case name)}}")
+  newPageText = newPageText.replace(sockTemplatesAtTopOfSection, newSockList)
+
 
   await spiHelperEditPage(spiHelperPageName, newPageText, 'Updating case following page move', false, spiHelperSettings.watchCase, spiHelperSettings.watchCaseExpiry, spiHelperStartingRevID)
   // Update to the latest revision ID
